@@ -48,6 +48,33 @@ mod tests;
 pub use cli::ConfigOverrides;
 pub use partial::{ConfigValue, SetPathError};
 
+/// The value paths that carry a separate `*_specified` presence flag. The env and CLI layers set both
+/// halves of these knobs; the TOML file and `--set` used to set only the value, so a file-set
+/// `ubatch` or KV dtype looked UNSPECIFIED to the placement code, which then ignored the user's
+/// choice and priced a chunk or format the runtime never used.
+fn specified_companion(path: &str) -> Option<&'static str> {
+    match path {
+        "device.ubatch" => Some("device.ubatch_specified"),
+        "kv.type_k" => Some("kv.type_k_specified"),
+        "kv.type_v" => Some("kv.type_v_specified"),
+        _ => None,
+    }
+}
+
+/// Record that a non-env layer (the TOML file or `--set`) set `path` explicitly, by setting its
+/// presence flag. A no-op for paths without one.
+pub(crate) fn mark_specified(layer: &mut PartialConfig, path: &str) -> Result<(), ConfigError> {
+    let Some(flag) = specified_companion(path) else {
+        return Ok(());
+    };
+    layer
+        .set_path(flag, "true")
+        .map_err(|e| ConfigError::Value {
+            path: flag.to_string(),
+            message: format!("{e:?}"),
+        })
+}
+
 use partial::cfg_struct;
 
 // ── sections ─────────────────────────────────────────────────────────────────

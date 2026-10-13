@@ -70,7 +70,7 @@ pub fn parse_reporting(
             });
         }
         match layer.set_path(path, raw) {
-            Ok(()) => {}
+            Ok(()) => super::mark_specified(&mut layer, path)?,
             Err(SetPathError::Unknown) => {
                 return Err(ConfigError::UnknownPath {
                     path: path.to_string(),

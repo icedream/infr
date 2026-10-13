@@ -159,6 +159,43 @@ fn absent_layer_does_not_clobber() {
     assert!(cfg.kernels.vulkan.mmv);
 }
 
+/// The TOML file and `--set` mark an explicitly set chunk height or KV dtype as specified, the same
+/// way the env and CLI layers do. Otherwise the placement code ignores the user's choice.
+#[test]
+fn file_and_set_mark_explicit_choices_as_specified() {
+    let cfg = Config::load_from_layers(&[file_layer(
+        "[device]\nubatch = 1024\n[kv]\ntype_k = \"q8_0\"\n",
+    )]);
+    assert!(
+        cfg.device.ubatch_specified,
+        "file ubatch must count as pinned"
+    );
+    assert!(
+        cfg.kv.type_k_specified,
+        "file type_k must count as specified"
+    );
+    assert!(
+        !cfg.kv.type_v_specified,
+        "an unset type_v stays unspecified"
+    );
+
+    let cfg = Config::load_from_layers(&[cli_layer(&["device.ubatch=512", "kv.type_v=f16"])]);
+    assert!(
+        cfg.device.ubatch_specified,
+        "--set ubatch must count as pinned"
+    );
+    assert!(
+        cfg.kv.type_v_specified,
+        "--set type_v must count as specified"
+    );
+
+    assert!(
+        !Config::load_from_layers(&[file_layer("")])
+            .device
+            .ubatch_specified
+    );
+}
+
 /// Within the CLI layer, a bespoke flag WINS over a `--set` for the same field, and says so.
 #[test]
 fn bespoke_flag_wins_over_set_and_warns() {

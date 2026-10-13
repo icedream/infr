@@ -126,7 +126,7 @@ fn walk(
             }
         };
         match out.set_path(&path, &raw) {
-            Ok(()) => {}
+            Ok(()) => super::mark_specified(out, &path)?,
             Err(SetPathError::Unknown) => warnings.push(unknown_line(&path)),
             Err(SetPathError::Value(message)) => return Err(ConfigError::Value { path, message }),
         }
