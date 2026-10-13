@@ -1232,7 +1232,8 @@ pub(crate) const KV_SLOP_ROWS: usize = 64;
 /// [`kv_bytes_estimate`] with the two sides priced INDEPENDENTLY. `INFR_KV_TYPE_K` and
 /// `INFR_KV_TYPE_V` are separate knobs and the runner allocates each side in its own dtype, so
 /// the context-fit math — which must compare against the REAL allocation size — cannot go through
-/// the single-`q8` flavor above.
+/// the single-`q8` flavor above. qwen35 gated-DeltaNet layers are priced at their fixed
+/// conv-history + recurrent state (see below), NOT as per-token rows.
 pub(crate) fn kv_bytes_estimate_fmt(
     cfg: &Config,
     want_ctx: usize,
@@ -1243,6 +1244,18 @@ pub(crate) fn kv_bytes_estimate_fmt(
 ) -> u64 {
     (0..cfg.n_layer)
         .map(|l| {
+            // qwen35 gated-DeltaNet layers cache NO per-token rows: the runner puts their
+            // fixed-size conv-history + recurrent state (f32, NOT ctx-scaled) in the same
+            // k/v buffer slots instead — the identical allocation `generate_dense_backend`
+            // makes in its qwen35 arm. Pricing them as `want_ctx` rows of a full-attention
+            // row (`kv_row_elems` answers the full GQA width for them, because they are not
+            // SWA layers) overstates the cache ~4x on a 1:3 DeltaNet:full model — 5 GB at
+            // 48k on Qwen3.8-27B — and turns a resident fit into a refused streaming budget.
+            if cfg.qwen35 && !cfg.is_qwen35_attn_layer(l) {
+                let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
+                let s_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
+                return (conv_elems + s_elems) as u64 * 4;
+            }
             let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch) + KV_SLOP_ROWS;
             // Per-side widths, NOT one shared width: MLA's K row is `kv_lora_rank + qk_rope_dim`
             // and it has no V side (see `kv_row_elems`).
@@ -3807,6 +3820,59 @@ mod seam_helper_tests {
         assert_eq!(est, old * 3 / 2, "the estimate was 1.5x short");
     }
 
+    /// qwen35 DeltaNet layers hold a FIXED conv-history + recurrent state in their k/v slots —
+    /// NOT `want_ctx` rows of a full-attention row. The estimator must price the allocation the
+    /// runner makes (`generate_dense_backend`'s qwen35 arm). Before the guard it priced every
+    /// layer as full GQA attention: ~6.9 GB of estimated KV at 48k against ~1.9 GB actually
+    /// allocated — enough to flip the residency check into streaming, where the over-priced
+    /// cache then ate the whole streaming budget and the start refused with
+    /// `leftover budget (0.00 GB)` on a 24 GB card that llama.cpp serves 140k on.
+    #[test]
+    fn kv_bytes_estimate_prices_qwen35_deltanet_state_not_ctx_rows() {
+        let cfg = qwen35_27b();
+        let ec = EngineConfig::default();
+        let ctx = 49_152usize;
+        // qwen35 declares no sliding window, so the session never rings; ring=false is what the
+        // placement and fit math price it at.
+        let est = super::kv_bytes_estimate_fmt(
+            &cfg,
+            ctx,
+            false,
+            super::ubatch_rows(&ec),
+            DType::Q8_0,
+            DType::Q8_0,
+        );
+        // The runner's allocation, summed layer by layer: 16 full-attention layers x 2 sides of
+        // (ctx + slop) rows x (n_kv x head_dim) elements, q8-sized like `kv_pair_bytes`; 48
+        // DeltaNet layers x (conv-history + recurrent state) f32 elements.
+        let attn = (0..cfg.n_layer)
+            .filter(|&l| cfg.is_qwen35_attn_layer(l))
+            .count();
+        let delta = cfg.n_layer - attn;
+        assert_eq!((attn, delta), (16, 48));
+        let side = super::kv_fmt_bytes(
+            DType::Q8_0,
+            (ctx + super::KV_SLOP_ROWS) * cfg.n_kv * cfg.head_dim,
+        ) as u64;
+        let state = ((cfg.ssm_d_conv - 1) * cfg.q35_conv_channels()
+            + cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim())
+            as u64
+            * 4;
+        let want = (attn as u64) * 2 * side + (delta as u64) * state;
+        assert_eq!(
+            est, want,
+            "the estimate must equal the allocation the runner makes"
+        );
+        // The pre-fix pricing, spelled out: every layer a full-attention row — ~5 GB over at 48k.
+        let old = (cfg.n_layer as u64) * 2 * side;
+        assert_eq!(old - est, (delta as u64) * (2 * side - state));
+        assert!(
+            old - est > 4_000_000_000u64,
+            "pre-fix overstatement was only {} bytes",
+            old - est
+        );
+    }
+
     /// `kv_q8_layout_ok` is the "may this model use a q8 cache" gate the Vulkan auto-q8 placement
     /// PIN consults, so it must reject MLA — the pin is priced into the VRAM estimate, and
     /// `generate_dense_backend` will build an f16 cache for MLA no matter what was pinned. The
@@ -3954,6 +4020,29 @@ mod seam_helper_tests {
             n_embd: 5120,
             n_ff: 17408,
             n_ctx_train: 40960,
+            ..Default::default()
+        }
+    }
+
+    /// `qwen3_14b`'s twin with Qwen3.8-27B's actual (qwen35) geometry: 64 trunk layers, a
+    /// full-attention layer every 4th (`(l+1) % full_attn_interval == 0` → 16 layers), the
+    /// remaining 48 gated-DeltaNet with the model's SSM dims.
+    fn qwen35_27b() -> Config {
+        Config {
+            qwen35: true,
+            n_layer: 64,
+            n_head: 24,
+            n_kv: 4,
+            head_dim: 256,
+            n_embd: 5120,
+            n_ff: 17408,
+            full_attn_interval: 4,
+            ssm_d_conv: 4,
+            ssm_d_state: 128,
+            ssm_d_inner: 6144,
+            ssm_n_group: 16,
+            ssm_dt_rank: 48,
+            n_ctx_train: 262144,
             ..Default::default()
         }
     }
